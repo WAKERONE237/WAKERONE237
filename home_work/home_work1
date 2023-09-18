@@ -1,0 +1,26 @@
+import math
+R = int(input("R="))
+l = 2*math.pi*R
+s = math.pi*R**2
+print("l=", round(l, 2))
+print("s=", round(s, 2))
+
+
+
+x = 10
+y = 55
+print("До замены x =",x)
+print("До замены y =",y)
+d = x
+x = y
+y = d
+
+print("После замены x =",x)
+print("После замены y =",y)
+
+
+import math
+l= int(input("Введите L:"))
+g = 9.81
+t = 2 * math.pi * math.sqrt(l/g)
+print(round(t, 2))
