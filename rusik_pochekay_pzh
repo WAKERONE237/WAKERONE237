@@ -1,0 +1,225 @@
+import os
+import csv
+import time
+import random
+import asyncio
+import logging
+from telethon.sync import TelegramClient
+from telethon.tl.types import InputPeerChannel, InputPeerUser
+from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.errors.rpcerrorlist import PeerFloodError, UserPrivacyRestrictedError
+from datetime import datetime, timedelta
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,  # Уровень логирования (можно заменить на DEBUG для более детальной информации)
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Формат логов
+    handlers=[
+        logging.FileHandler('invite_debug.log', encoding='utf-8'),  # Лог в файл
+        logging.StreamHandler()  # Вывод в консоль
+    ]
+)
+
+# Глобальная переменная для хранения статистики и приглашенных пользователей
+statistics = {
+    'accounts': {}
+}
+
+# Список для отслеживания уже приглашенных пользователей
+invited_users_global = set()
+
+# Чтение конфигураций
+def load_accounts():
+    logging.info("Чтение конфигураций аккаунтов.")
+    accounts = []
+    with open('accounts.txt', 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        next(reader)  # Пропуск заголовка
+        for row in reader:
+            if len(row) < 4:
+                logging.warning(f"Строка пропущена из-за недостаточных данных: {row}")
+                continue  # Пропускаем строки с недостаточными данными
+            account = {
+                'phone': row[0],
+                'api_id': row[1],
+                'api_hash': row[2],
+                'proxy': {
+                    'proxy_type': 'socks5',
+                    'addr': row[3],
+                    'port': int(row[4]),
+                    'username': row[5],
+                    'password': row[6]
+                } if len(row) > 6 else None
+            }
+            accounts.append(account)
+            # Инициализация статистики для каждого аккаунта
+            statistics['accounts'][row[0]] = {
+                'sent_invites': 0,
+                'successful_invites': 0,
+                'failed_invites': 0,
+                'next_invite_time': None,
+                'stopped': False
+            }
+    logging.info(f"Загружено {len(accounts)} аккаунтов.")
+    return accounts
+
+# Чтение списка пользователей из CSV
+def load_users(file):
+    logging.info("Чтение списка пользователей.")
+    users = []
+    with open(file, encoding='UTF-8') as f:
+        rows = csv.reader(f, delimiter=",", lineterminator="\n")
+        next(rows, None)  # Пропуск заголовка
+        for row in rows:
+            if len(row) < 4:
+                logging.warning(f"Строка пропущена из-за недостаточных данных: {row}")
+                continue  # Пропускаем строки с недостаточными данными
+            user = {
+                'username': row[0],
+                'id': int(row[1]),
+                'access_hash': int(row[2]),
+                'name': row[3]
+            }
+            users.append(user)
+    logging.info(f"Загружено {len(users)} пользователей.")
+    return users
+
+# Подключение аккаунта Telegram
+def connect_client(account):
+    session_file = f"sessions/{account['phone']}.session"
+
+    if os.path.exists(session_file):
+        logging.info(f"[+] Файл сессии для {account['phone']} найден. Используем существующую сессию.")
+    else:
+        logging.warning(f"[!] Файл сессии для {account['phone']} не найден. Пропускаем.")
+        return None
+
+    client = TelegramClient(
+        session_file,
+        int(account['api_id']),
+        account['api_hash'],
+        proxy=account['proxy'],
+        system_version="4.16.30-vxCUSTOM",
+        device_model="iPhone 13 Pro",
+        app_version="10.2.0"
+    )
+
+    # Пробуем подключиться
+    try:
+        client.connect()
+        logging.info(f"[+] Подключение к {account['phone']} успешно.")
+    except Exception as e:
+        logging.error(f"[!] Ошибка при подключении к аккаунту {account['phone']}: {e}")
+        return None
+
+    # Проверяем авторизацию пользователя
+    if not client.is_user_authorized():
+        logging.warning(f"[!] Аккаунт {account['phone']} не авторизован или файл сессии истек.")
+        return None
+
+    logging.info(f"[+] Аккаунт {account['phone']} авторизован успешно.")
+    return client
+
+# Функция для отправки инвайтов с одного аккаунта
+async def invite_from_account(client, users, target_group, account_phone, delay_range):
+    global invited_users_global
+    successful_invites = 0
+
+    while successful_invites < 3:  # 3 успешных приглашения в сутки
+        try:
+            # Выбираем случайного пользователя из списка
+            user = random.choice(users)
+
+            # Проверка, был ли пользователь уже приглашен глобально
+            if user['username'] and user['username'] not in invited_users_global:
+                logging.info(f"[+] Добавляем пользователя {user['username']} через аккаунт {client.session.filename}")
+                user_to_add = client.get_input_entity(user['username'])
+                client(InviteToChannelRequest(target_group, [user_to_add]))
+
+                # Добавляем пользователя в глобальный список приглашенных
+                invited_users_global.add(user['username'])
+                successful_invites += 1
+
+                # Обновление статистики
+                statistics['accounts'][account_phone]['sent_invites'] += 1
+                statistics['accounts'][account_phone]['successful_invites'] += 1
+
+                logging.info(f"[+] Успешно добавлен {user['username']} через username.")
+
+            else:
+                logging.warning(f"[!] Пользователь {user['username']} уже был приглашен. Пропускаем.")
+
+            # Устанавливаем случайную задержку в часах
+            delay = random.randint(*delay_range)  # Рандомная задержка в часах
+            next_invite_time = datetime.now() + timedelta(hours=delay)
+            statistics['accounts'][account_phone]['next_invite_time'] = next_invite_time
+
+            logging.info(f"[+] Аккаунт {client.session.filename} будет ждать {delay} часов до следующего инвайта.")
+            await asyncio.sleep(delay * 3600)  # Конвертируем часы в секунды
+
+        except UserPrivacyRestrictedError:
+            logging.warning(f"[!] Приватность пользователя {user['username']} не позволяет добавлять его через username.")
+            statistics['accounts'][account_phone]['failed_invites'] += 1
+        except PeerFloodError:
+            logging.error("[!] Слишком много запросов. Прекращаем работу.")
+            statistics['accounts'][account_phone]['stopped'] = True
+            break
+        except Exception as e:
+            logging.error(f"[!] Ошибка: {e}")
+            statistics['accounts'][account_phone]['failed_invites'] += 1
+
+# Основной процесс для каждого аккаунта
+async def process_account(account, users, target_group):
+    logging.info(f"Начало обработки аккаунта {account['phone']}.")
+    client = connect_client(account)
+
+    if client:
+        # Случайная задержка между инвайтами от 4 до 8 часов
+        delay_range = (4, 8)
+        await invite_from_account(client, users, target_group, account['phone'], delay_range)
+        client.disconnect()
+        logging.info(f"Отключение клиента для аккаунта {account['phone']}.")
+
+# Функция для вывода статистики
+def print_statistics():
+    logging.info("Запрос статистики.")
+    print("\n=== Статистика инвайтов ===")
+    for phone, stats in statistics['accounts'].items():
+        print(f"Аккаунт: {phone}")
+        print(f"   Отправлено инвайтов: {stats['sent_invites']}")
+        print(f"   Успешных инвайтов: {stats['successful_invites']}")
+        print(f"   Неудачных инвайтов: {stats['failed_invites']}")
+        print(f"   Время следующего инвайта: {stats['next_invite_time']}")
+        print(f"   Остановлен из-за лимитов: {'Да' if stats['stopped'] else 'Нет'}")
+    print("===========================\n")
+
+# Главная функция для обработки всех аккаунтов
+async def main():
+    logging.info("Запуск программы.")
+    accounts = load_accounts()
+    users = load_users('members.csv')
+
+    target_group_id = input("[+] Введите ID группы для инвайтов: ")
+    target_group_hash = input("[+] Введите access_hash группы: ")
+    target_group = InputPeerChannel(int(target_group_id), int(target_group_hash))
+
+    tasks = []
+    for account in accounts:
+        task = process_account(account, users, target_group)
+        tasks.append(task)
+
+    # Запускаем асинхронно все задачи
+    await asyncio.gather(*tasks)
+
+    # Запрос статистики в любое время
+    while True:
+        command = input("Введите 'stats' для просмотра статистики или 'exit' для выхода: ").strip().lower()
+        if command == 'stats':
+            print_statistics()
+        elif command == 'exit':
+            logging.info("Завершение работы.")
+            break
+
+# Запуск программы
+if __name__ == '__main__':
+    asyncio.run(main())
